@@ -1,0 +1,220 @@
+podTemplate(
+label: "lgi-jenkins-slave-maven",
+cloud: "openshift",
+inheritFrom: "maven",
+containers: [
+	containerTemplate(
+		name: "jnlp",
+		image: "docker-registry.default.svc:5000/cicd/lgi-jenkins-slave-maven",
+		resourceRequestMemory: "1Gi",
+		resourceLimitMemory: "2Gi",
+		resourceLimitCpu: "2",
+		resourceRequestCpu: "1",
+		envVars: [
+            envVar(key: "HTTP_PROXY", value: "http://172.23.29.155:3128"),
+            envVar(key: "HTTPS_PROXY", value: "http://172.23.29.155:3128"),
+            envVar(key: "NO_PROXY", value: ".csa.internal,.libgbl.biz,.upc.biz,lg-l-p-msa00001,lg-l-p-msa00002,lg-l-p-msa00003,lg-l-p-msa00004,lg-l-p-msa00005,lg-l-p-msa00006,lg-l-p-msa00007,lg-l-p-msa00008,lg-l-p-msa00009,10.170.0.1,172.23.116.148,172.23.116.149,172.23.116.150,.cluster.local,.svc")
+            ],
+	)
+	]
+)
+{
+	node('lgi-jenkins-slave-maven') {
+		properties([
+			parameters([
+				string(name: 'IMAGE_VERSION', defaultValue: '', description: 'Version of image that need be deployed ex: 1.0.9', ),
+				string(name: 'APPLICATION_NAME', defaultValue: '', description: 'Name of apllication that is to be deployed ex: 1.0.9', ),
+				choice(name: 'SECRETS',choices: ['Yes','No'], description: 'Does the module contain secret', ),
+				choice(name: 'CERTIFICATES',choices: ['Yes','No'], description: 'Does the module contain certificate', ),
+				string(name: 'TARGET_NAMESPACE', defaultValue: '', description: 'name of the namespace where need be release?  ex: ie-product-sit', )
+			]),
+		])
+
+		def APPLICATION_NAME = "${params.APPLICATION_NAME}"
+		def APP_BRANCH = "*/development"
+		def TARGET_NAMESPACE = "${params.TARGET_NAMESPACE}"
+		def FLAG = "10"
+		def ENV = "env"
+		def releaseTag = "${params.IMAGE_VERSION}"
+		def SECRET = "${params.SECRETS}"
+		def CERTIFICATE = "${params.CERTIFICATES}"
+		
+		echo "APPLICATION_NAME : ${APPLICATION_NAME}, TARGET_NAMESPACE: ${TARGET_NAMESPACE}, releaseTag: ${releaseTag}, secret: ${SECRET}, certificate: ${CERTIFICATE}"
+		stage('Verification'){
+		    ENV = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | rev | cut -f1 -d '-' | rev").trim()
+			sh "echo $ENV"
+			sh "echo flag is $FLAG"
+			if (ENV != "uat"){
+				error("This pipeline only executes for PROD Environment")
+				sh "echo flag is $FLAG"
+			}
+		}
+		
+		def CONFDIR = "openshift/"+ENV
+		def BLUEGREENCONFDIR = "openshift/"+ENV
+		def activeApp = APPLICATION_NAME+"-blue"
+		def propertiesfile = "svc-green.app.properties"
+		def destApp   = APPLICATION_NAME+"-green"
+		def CONFIGMAP_NAME = APPLICATION_NAME+"-green-properties"
+		def SECRET_NAME = APPLICATION_NAME+"-green-secret"
+		def APPLICATION_PIPELINE = "green"
+		def OCPDOMAIN = "apps.cluster-np001.msp.upc.biz"
+		def MGMTDOMAIN = "apps.cluster-np001.msp.upc.biz"
+		def NEXUS_CREDID = "nexus_cred"
+		
+		
+		
+
+		stage('Code Checkout'){
+			COUNTRY = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | cut -f1 -d '-'").trim()
+			sh "echo country is $COUNTRY"
+			sh "ls -ltr"
+			git branch: 'development', credentialsId: 'JenkinsGitUser', url: "https://git.apps.build.msa.libgbl.biz/$COUNTRY/${APPLICATION_NAME}"
+			sh "ls -ltr"
+		}
+		
+		stage('Copy image from Nexus') {
+			openshift.withCluster('non-prod-aws') {
+				def token = openshift.raw("whoami -t")
+				def DEST_TOKEN = token.out.trim()
+				withCredentials([usernamePassword(credentialsId: NEXUS_CREDID , passwordVariable: 'nexus_pass', usernameVariable: 'nexus_user')]) {
+				 sh "skopeo --debug copy --src-tls-verify=false --dest-tls-verify=false --src-creds ${nexus_user}:${nexus_pass} --dest-creds openshift:${DEST_TOKEN} docker://nexus-registry.cicd.svc.cluster.local:5000/${APPLICATION_NAME}:${releaseTag} docker://default-route-openshift-image-registry.apps.cluster-np001.msp.upc.biz:443/openshift/${APPLICATION_NAME}:${releaseTag}"
+				}					
+			}
+		}
+
+		stage('login non-prod-aws'){
+			openshift.withCluster('non-prod-aws'){
+				def token = openshift.raw("whoami -t")
+				def DEST_TOKEN = token.out.trim()
+				def server_url = openshift.raw("whoami --show-server")
+				def SERVER_URL = server_url.out.trim()
+				echo "server url ${SERVER_URL}"
+				sh "oc login -s ${SERVER_URL}  --token=${DEST_TOKEN} --insecure-skip-tls-verify"
+			}
+		}
+
+		stage('Blue/Green Production Deployment'){
+			openshift.withCluster('non-prod-aws'){
+      		openshift.withProject( "${TARGET_NAMESPACE}" ){
+                  def props = readProperties  file: "${BLUEGREENCONFDIR}/bluegreen/${propertiesfile}"
+                  def OPCO = props['OPCO']
+                  def DOMAIN = props['DOMAIN']
+       
+				sh "if oc get service ${APPLICATION_NAME} -n ${TARGET_NAMESPACE} ; then echo service is there ; else oc process -f ./${BLUEGREENCONFDIR}/bluegreen/svc-switchservices.yml -p APPLICATION_NAME=${APPLICATION_NAME} -p APPLICATION_PIPELINE=${APPLICATION_PIPELINE} -p TARGET_NAMESPACE=${TARGET_NAMESPACE} -p OPCO=${OPCO} -p DOMAIN=${DOMAIN} -n ${TARGET_NAMESPACE}| oc apply -f - -n ${TARGET_NAMESPACE} ; fi;"
+
+       
+			// fetching route name
+			def ROUTE_NAME= props['ROUTE_NAME']
+			if (ROUTE_NAME != null){
+			sh "if oc get route ${ROUTE_NAME} -n ${TARGET_NAMESPACE} ; then echo route is there ; else oc process -f ./${BLUEGREENCONFDIR}/bluegreen/svc-route.yml -p OCPDOMAIN=${OCPDOMAIN}  -p TARGET_NAMESPACE=${TARGET_NAMESPACE} -p APPLICATION_NAME=${APPLICATION_NAME} -p ROUTE_NAME=${ROUTE_NAME} -n ${TARGET_NAMESPACE}| oc apply -f - -n ${TARGET_NAMESPACE} ; fi;"
+		   }
+			else {
+			sh "oc process -f ./${BLUEGREENCONFDIR}/bluegreen/svc-route.yml -p OCPDOMAIN=${OCPDOMAIN} -p APPLICATION_NAME=${APPLICATION_NAME} -p TARGET_NAMESPACE=${TARGET_NAMESPACE} -n ${TARGET_NAMESPACE}| oc apply -f - -n ${TARGET_NAMESPACE}"
+			}
+			activeApp = sh(returnStdout: true, script: "oc get service ${APPLICATION_NAME} -n ${TARGET_NAMESPACE} -o jsonpath='{ .spec.selector.deploymentconfig }'").trim()
+			if (activeApp == APPLICATION_NAME+"-green") {
+				destApp = APPLICATION_NAME+"-blue"
+				propertiesfile = "svc-blue.app.properties"
+				CONFIGMAP_NAME = APPLICATION_NAME+"-blue-properties"
+				SECRET_NAME = APPLICATION_NAME+"-blue-secret" 
+				APPLICATION_PIPELINE = "blue"
+			}
+			echo "Active Application:" + activeApp
+			echo "Destination Application: " + destApp
+			// Update the Config Map
+			sh "oc process -f ./${CONFDIR}/configmap.yml -p APPLICATION_NAME=${APPLICATION_NAME} -p CONFIGMAP_NAME=${CONFIGMAP_NAME} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+			// Update the Secret
+			if (SECRET == "Yes") {
+				echo "Secret function is true"
+				sh "oc process -f ./${CONFDIR}/secret.yml -p APPLICATION_NAME=${APPLICATION_NAME} -p SECRET_NAME=${SECRET_NAME} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+				
+			}
+			sh "oc process -f ./${BLUEGREENCONFDIR}/bluegreen/svc-deployment.yml --param-file=./${BLUEGREENCONFDIR}/bluegreen/${propertiesfile} -p OCPDOMAIN=${OCPDOMAIN} -p ENV=${ENV} -p TAG=${releaseTag} -p TARGET_NAMESPACE=${TARGET_NAMESPACE} -p OPCO=${OPCO} -p DOMAIN=${DOMAIN} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+
+			// Create certificate
+			if (CERTIFICATE == "Yes") {
+			echo "Certificate creation"
+			
+			JKS_FILENAME = sh(returnStdout: true, script: "ls ${CONFDIR} | grep jks").trim()
+			sh "echo jks filename is ${JKS_FILENAME}"
+			JKS_PATH_tmp = CONFDIR+"/"+JKS_FILENAME
+			JKS_PATH = sh(returnStdout: true, script: "echo ${JKS_PATH_tmp}").trim()
+			sh "echo JKS path is ${JKS_PATH} path"
+			withCredentials([string(credentialsId: 'truststore_password', variable: 'truststore_password')]){
+		 sh "if oc get secret ${SECRET_NAME} -n ${TARGET_NAMESPACE} ; then oc delete secret ${SECRET_NAME} -n ${TARGET_NAMESPACE};fi;"
+         sh "oc create secret generic ${SECRET_NAME} --from-file=truststore.jks=${JKS_PATH} --from-literal=trustStorePassword=${truststore_password} -n ${TARGET_NAMESPACE}" 
+}
+}
+		}
+	}
+	}
+		stage('Updating image') {
+			openshift.withCluster('non-prod-aws'){
+				openshift.withProject( "${TARGET_NAMESPACE}" ){
+					//  Update the Image on the Production Deployment Config
+					openshift.raw("set","image dc/${destApp}","${destApp}=image-registry.openshift-image-registry.svc:5000/openshift/${APPLICATION_NAME}:${releaseTag}","-n ${TARGET_NAMESPACE}")
+				}
+			}
+		}
+
+		stage('Verify Deployment'){
+			echo "verify deployment"
+			openshift.withCluster('non-prod-aws'){
+				openshift.withProject( "${TARGET_NAMESPACE}" ) {
+					def DeploymentVersion = openshift.selector('dc',"${destApp}").object().status.latestVersion
+					echo "Previous DeploymentVersion: ${DeploymentVersion}" 
+					try {
+						def deployment = openshift.selector('dc', "${destApp}")
+						echo "rollout deployment"
+						deployment.rollout().latest()
+					} catch(e) {
+						echo e.getMessage()
+						if(e.getMessage().contains("already in progress")){
+							sh "oc scale dc/${destApp} --replicas=0 -n ${TARGET_NAMESPACE}"
+							sleep 120
+							throw e
+						}
+					}
+					def latestDeploymentVersion = openshift.selector('dc',"${destApp}").object().status.latestVersion
+					def rc = openshift.selector('rc', "${destApp}-${latestDeploymentVersion}")
+					def props = readProperties  file: "${BLUEGREENCONFDIR}/bluegreen/${propertiesfile}"
+					def REPLICAS= props['REPLICAS']
+					sh "oc scale dc/${destApp} --replicas=${REPLICAS} -n ${TARGET_NAMESPACE}"
+					echo "latestDeploymentVersion: ${latestDeploymentVersion}, rc: ${rc}"
+					timeout(time:15, unit:'MINUTES') {
+						rc.untilEach(1){
+							def rcMap = it.object()
+							return (rcMap.status.replicas.equals(rcMap.status.readyReplicas))
+						}
+					}
+					echo "${destApp} is running and it passed readiness check!"
+				}
+			}
+		}
+		
+		stage('Sanity Check'){
+			echo "sanity test : ${destApp}"
+			sleep 30
+			echo "Health check"
+			//sh "curl -i -k https://${APPLICATION_NAME}-actuator-${TARGET_NAMESPACE}.${MGMTDOMAIN}/actuator/health"
+			echo "Microservice info"
+			//sh "curl -i -k -H 'Content-Length: 0' -X GET https://${destApp}-actuator-${TARGET_NAMESPACE}.${MGMTDOMAIN}/actuator/info/"
+		}
+
+		stage('Switch over to new Version') {
+			def props = readProperties  file: "${BLUEGREENCONFDIR}/bluegreen/${propertiesfile}"
+            def OPCO = props['OPCO']
+            def DOMAIN = props['DOMAIN']
+			// input "Switch Production?"
+			echo "Switching Production application to ${destApp}."
+			openshift.withCluster('non-prod-aws'){
+				openshift.withProject( "${TARGET_NAMESPACE}" ) {
+                  sh "oc process -f ./${BLUEGREENCONFDIR}/bluegreen/svc-switchservices.yml -p APPLICATION_NAME=${APPLICATION_NAME} -p APPLICATION_PIPELINE=${APPLICATION_PIPELINE} -p OPCO=${OPCO} -p DOMAIN=${DOMAIN} -n ${TARGET_NAMESPACE}| oc apply -f - -n ${TARGET_NAMESPACE} "
+                  sleep 60
+                  sh "if oc get dc ${activeApp} -n ${TARGET_NAMESPACE} ; then oc scale dc/${activeApp} --replicas=0 -n ${TARGET_NAMESPACE} ; fi ;"
+				}
+			}
+		}
+	}
+}
