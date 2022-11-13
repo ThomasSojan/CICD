@@ -1,0 +1,320 @@
+podTemplate(
+label: "lgi-jenkins-slave-maven",
+cloud: "openshift",
+inheritFrom: "maven",
+containers: [
+  containerTemplate(
+    name: "jnlp",
+    image: "docker-registry.default.svc:5000/cicd/lgi-jenkins-slave-maven",
+    resourceRequestMemory: "1Gi",
+    resourceLimitMemory: "2Gi",
+    envVars: [
+            envVar(key: 'http_proxy', value: env.http_proxy),
+            envVar(key: 'https_proxy', value: env.https_proxy),
+            envVar(key: 'no_proxy', value: env.no_proxy)]
+    )
+  ]
+)
+
+{
+	node('lgi-jenkins-slave-maven') {
+    	properties([
+      	parameters([
+        string(name: 'DEPLOYER_USER', defaultValue: '', description: 'deployer_username ex: deployer_username', ),
+        string(name: 'DEPLOYER_MAIL', defaultValue: '', description: 'deployer_mail ex: deployer_mail@domain.com', ),
+        string(name: 'MESSAGE', defaultValue: '', description: 'Release message', ),
+        string(name: 'APPLICATION_NAME', defaultValue: '', description: 'Name of application that is to be deployed ex: ie-clarify-customer-sys', ),
+        choice(name: 'SECRETS',choices: ['Yes','No'], description: 'Does the module contain secret', ),
+        choice(name: 'NEXUS_PARAM',choices: ['Yes','No'], description: 'Does the module have downstream connectivity, ie having -ms folder in repository', ),
+        string(name: 'TARGET_NAMESPACE', defaultValue: '', description: 'name of the namespace where need be release?  ex: ie-product-dev', )
+      	]),
+      	[$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '7', numToKeepStr: '5']]
+    	])
+
+      def APPLICATION_NAME = "${params.APPLICATION_NAME}"
+      def RELEASE_APP = APPLICATION_NAME+"-release"
+      def APP_BRANCH = "*/development"
+      def ARTIFACT_DIR = "${params.APPLICATION_NAME}/target"
+      def CONFIGMAP_NAME = APPLICATION_NAME+"-release-properties"
+      def OSCONFDIR = 'openshift/dev'
+      def TARGET_NAMESPACE = "${params.TARGET_NAMESPACE}"
+      def SOURCE_TAG = 'latest'
+      def BUILD_IMAGE = "lg-openjdk18-openshift"
+      def MGMTDOMAIN = "apps.mgmt.npd.msa.libgbl.biz"
+      def GITEA_CREDID = "gitea_cred"
+      def NEXUS_CREDID = "nexus_cred"
+      def MAIL = "${params.DEPLOYER_MAIL}"
+      def USERNAME = "${params.DEPLOYER_USER}" 
+      def MESSAGE =  "${params.DEPLOYER_USER}-${params.MESSAGE}"
+      def SONAR_URL = "http://sonarqube.cicd.svc.cluster.local:9000"
+      def GROUP_ID = "com.lgims.cio"
+      def SECRET_SELECTION = "${params.SECRETS}"
+      def NEXUS_SELECTION = "${params.NEXUS_PARAM}"
+      def ROUTE_NAME = sh(returnStdout: true, script: "echo ${params.APPLICATION_NAME} | cut --complement -d \"-\" -f1")
+      def RELEASE_APP_ROUTE = ROUTE_NAME+"-release"
+      def NEXUS_APPPATH = ""
+      def SECRET_FLAG = "1"
+      def SECRET_NAME = ""
+      def newversion = ""
+      def imageversion = ""
+	  def FLAG = "10"
+	  def ENV = "env"
+
+      //update the secret
+      if (SECRET_SELECTION == "Yes") {
+          echo "Secret function is true and Flag is changed"
+          SECRET_NAME = APPLICATION_NAME+"-release-secret"
+          SECRET_FLAG = 0
+      }
+
+      //update nexus app path
+      if (NEXUS_SELECTION == "Yes") {
+          echo "Module has downstream connectivity"
+          NEXUS_APPPATH = APPLICATION_NAME+"-ms"	
+      }
+      else {
+          NEXUS_APPPATH = APPLICATION_NAME
+      }
+	  
+	  stage('Environment Verification'){
+		    ENV = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | rev | cut -f1 -d '-' | rev").trim()
+			sh "echo $ENV"
+			sh "echo flag is $FLAG"
+			if (ENV != "dev"){
+				error("This pipeline can only be executed in Development Environment")
+				sh "echo flag is $FLAG"
+			}
+	  }
+
+      stage('Code checkout'){
+          //deleteDir()
+          sh "git config --global http.sslVerify false"
+          sh "git config --global credential.helper store"
+          COUNTRY = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | cut -f1 -d '-'").trim()
+          checkout([$class: 'GitSCM', branches: [[name: '*/development']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'gitAdmin', url: "https://git.apps.build.msa.libgbl.biz/$COUNTRY/${APPLICATION_NAME}"]]])
+          sh "git config user.email ${MAIL}"
+          sh "git config user.name ${USERNAME}"
+          sh "ls -ltr"
+          sh "pwd"
+        }
+
+      stage ('Code Analysis'){
+          echo "Running Code Analysis"
+          sh "mvn -s configuration/settings.xml clean install sonar:sonar -Dsonar.scm.disabled=true -Dsonar.sources=src/main "
+          sleep 20
+          PROJECTKEY="$GROUP_ID:$APPLICATION_NAME"
+          def SONAR_API_RESPONSE = "curl -k -X POST $SONAR_URL/api/qualitygates/project_status?projectKey=$PROJECTKEY"
+          def CMD_OUTPUT = sh returnStdout: true, script: "${SONAR_API_RESPONSE}"
+          def qualitygate =  readJSON text: CMD_OUTPUT
+
+          sh "echo Quality gate shows ${qualitygate.projectStatus.status}" 
+          if(qualitygate.projectStatus.status == "OK"){
+               echo "Sonar Quality check passed."
+          } 
+          else {
+               def errorList = " "
+               for (i = 0; i < qualitygate.projectStatus.conditions.size()-1; i++) {
+                   if (qualitygate.projectStatus.conditions[i].status == "ERROR"){
+                         def msg = "${qualitygate.projectStatus.conditions[i].metricKey} - Actual - ${qualitygate.projectStatus.conditions[i].actualValue} but Expected - ${qualitygate.projectStatus.conditions[i].errorThreshold}"
+                         if(errorList.size() <= 0)
+                            errorList = "errorList $msg"
+                         else
+                            errorList = "errorList , $msg"
+                   }
+               }
+               sh "echo Reasons for failure: $errorList "
+               error "Sonar Quality check failed."
+          }
+      }
+
+      stage('code build and Release Nexus'){
+          withCredentials([usernamePassword(credentialsId: GITEA_CREDID , passwordVariable: 'gitea_pass', usernameVariable: 'gitea_user')]) {
+              sh "mvn -Dmaven.test.skip=true -Dmaven.javadoc.skip=true  -s ./configuration/settings.xml -X jgitflow:release-start -Dgit.user=${gitea_user} -Dgit.password=${gitea_pass} -Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true -Dmaven.wagon.http.ssl.ignore.validity.dates=true"
+              imageversion = version()
+
+              if(imageversion.contains("SNAPSHOT")){
+                  newversion = imageversion.replace("-SNAPSHOT", "")
+              } 
+              else {
+                  newversion = imageversion
+              }
+
+              tagging(message) 
+
+              echo "version: ${imageversion}  newversion: ${newversion}"
+
+              sh "mvn -Dmaven.test.skip=true -Dmaven.javadoc.skip=true  -s ./configuration/settings.xml -X jgitflow:release-finish -Dgit.user=${gitea_user} -Dgit.password=${gitea_pass} -Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true -Dmaven.wagon.http.ssl.ignore.validity.dates=true -DaltDeploymentRepository=releases::default::http://nexus3.cicd.svc.cluster.local:8081/repository/maven-releases"
+              }
+      }
+
+      stage('Create Image Builder') {
+          // Create or replace Image builder artifacts        
+          echo "Creating Image Builder"
+          sh "if oc get bc ${RELEASE_APP} -n cicd; \
+              then echo \"exist\"; \
+              else oc new-build --binary=true --name=${RELEASE_APP} ${BUILD_IMAGE} --labels=app=${RELEASE_APP} -n cicd;fi "                             
+      }
+
+      stage('Build OpenShift Image') {
+          echo "Building OpenShift container image ${RELEASE_APP}:latest"
+          // Start Binary Build in OpenShift CICD cluster using the file we just published
+          sh "oc start-build ${RELEASE_APP} --follow=true --from-file=http://nexus3.cicd.svc.cluster.local:8081/repository/maven-releases/com/lgims/cio/${NEXUS_APPPATH}/${newversion}/${NEXUS_APPPATH}-${newversion}.jar -n cicd"
+          echo "oc start build complete."
+      }
+
+      stage('Copy Image to Non-Prod Cluster'){
+          openshift.withCluster('non-prod'){
+            def token = openshift.raw("whoami -t")
+            def DEST_TOKEN = token.out.trim()
+            def SRC_TOKEN = sh(returnStdout: true, script:"oc whoami -t").trim()
+
+            //Copy the image to the registry on the non-prod cluster to the target namespace
+            sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:${SRC_TOKEN} --dest-creds openshift:${DEST_TOKEN} docker://docker-registry.default.svc:5000/cicd/${RELEASE_APP}:latest docker://docker-registry-default.apps.mgmt.npd.msa.libgbl.biz:443/${TARGET_NAMESPACE}/${RELEASE_APP}:latest"
+          }
+      }
+
+      stage('login to openshift'){
+          openshift.withCluster('non-prod'){
+            def token = openshift.raw("whoami -t")
+            def DEST_TOKEN = token.out.trim()
+            def server_url = openshift.raw("whoami --show-server")
+            def SERVER_URL = server_url.out.trim()
+            echo "server url ${SERVER_URL}"
+            sh "oc login -s ${SERVER_URL}  --token=${DEST_TOKEN} --insecure-skip-tls-verify"
+          }
+      }
+
+      stage('Update Configurations'){ 
+          sh "sed -i '/selfLink:/d' ${OSCONFDIR}/*.yml"
+          sh "sed -i 's/${APPLICATION_NAME}/${RELEASE_APP}/g' ${OSCONFDIR}/*.yml"
+          sh "oc delete all -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+          sh "oc delete configmap -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+          // Update the Config Map
+          sh "oc process -f ./${OSCONFDIR}/configmap.yml -p APPLICATION_NAME=${RELEASE_APP} -p CONFIGMAP_NAME=${CONFIGMAP_NAME} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+          // Update the Secret
+          if(SECRET_FLAG == 0){
+            sh "oc delete secret -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+            sh "oc process -f ./${OSCONFDIR}/secret.yml -p APPLICATION_NAME=${RELEASE_APP} -p SECRET_NAME=${SECRET_NAME} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+          }
+          sh "oc delete dc -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+          sh "oc apply -f ${OSCONFDIR}/deployment.yml  -n ${TARGET_NAMESPACE}"
+          sh "if  oc get service ${RELEASE_APP} -n ${TARGET_NAMESPACE} ; then echo service is there ; else oc apply -f ${OSCONFDIR}/service.yml  -n ${TARGET_NAMESPACE} ; fi; "
+          sh "if  oc get route ${RELEASE_APP} -n ${TARGET_NAMESPACE} ; then echo rouet is there ; else oc apply -f ${OSCONFDIR}/route.yml  -n ${TARGET_NAMESPACE} ; fi; "
+
+      }     
+
+      stage('Updating image') {
+          openshift.withCluster('non-prod'){
+              openshift.withProject( "${TARGET_NAMESPACE}" ){
+                  //  Update the Image on the Production Deployment Config
+                  openshift.raw("set","image dc/${RELEASE_APP}","${RELEASE_APP}=docker-registry.default.svc:5000/${TARGET_NAMESPACE}/${RELEASE_APP}:latest","-n ${TARGET_NAMESPACE}")
+                  }
+              }
+      }
+
+      stage('Verify Deployment'){
+          echo "verify deployment"
+          openshift.withCluster('non-prod'){
+                  openshift.withProject( "${TARGET_NAMESPACE}" ) {
+                      def latestDeploymentVersion = openshift.selector('dc',"${RELEASE_APP}").object().status.latestVersion
+                      def rc = openshift.selector('rc', "${RELEASE_APP}-${latestDeploymentVersion}")
+                      echo "latestDeploymentVersion: ${latestDeploymentVersion}, rc: ${rc}"
+                      timeout(time:10, unit:'MINUTES') {
+                          rc.untilEach(1){
+                          def rcMap = it.object()
+                          return (rcMap.status.replicas.equals(rcMap.status.readyReplicas))
+                          }
+                      }
+                  echo "${RELEASE_APP} is running and it passed readiness check!"
+
+                  }
+          }
+      }
+
+      stage('Create Routes') {
+          openshift.withCluster('non-prod'){
+              openshift.withProject( "${TARGET_NAMESPACE}" ) {
+                  // Always create a management route so that developers can test
+                  try {
+                      def template = openshift.withProject( 'msp-user-objects' ) {
+                          openshift.selector('template','msp-mgmt-route-non-prod').object()
+                      }
+                      openshift.create( openshift.process( template, "-p", "NAMESPACE=${TARGET_NAMESPACE}", "APP=${RELEASE_APP}", "TARGET_SERVICE=${RELEASE_APP}", "TARGET_PORT=8080-tcp" ) )
+                      //openshift.create( openshift.process( template, "-p", "NAMESPACE=${TARGET_NAMESPACE}", "APP=${RELEASE_APP}9090", "TARGET_SERVICE=${RELEASE_APP}", "TARGET_PORT=9090-tcp" ) )
+                  } catch(e) {
+                      echo e.getMessage()
+                      if(!e.getMessage().contains("AlreadyExists")){
+                          throw e
+                          }
+                  }   
+              }
+          }
+      }   
+
+  /*  stage('Sanity Check'){
+          echo "sanity test : ${RELEASE_APP}"
+          sleep 30
+          echo "Health check"
+         // sh "curl -i -k https://${RELEASE_APP}9090-${TARGET_NAMESPACE}.${MGMTDOMAIN}/actuator/health"
+
+          echo "Microservice info"
+        //  sh "curl -i -k -H 'Content-Length: 0' -X GET https://${RELEASE_APP}9090-${TARGET_NAMESPACE}.${MGMTDOMAIN}/actuator/info/"
+      }
+  */
+
+      stage('Image Tagging'){
+          echo "version: ${imageversion}  newversion: ${newversion}"
+          // pushing to common Image store namespace
+          sh "oc tag ${TARGET_NAMESPACE}/${RELEASE_APP}:${SOURCE_TAG}  ${TARGET_NAMESPACE}/${APPLICATION_NAME}:${newversion}"
+
+      }
+
+      stage('Copy image to Nexus') {
+          openshift.withCluster('non-prod') {
+              def token = openshift.raw("whoami -t")
+              def DEST_TOKEN = token.out.trim()
+              withCredentials([usernamePassword(credentialsId: NEXUS_CREDID , passwordVariable: 'nexus_pass', usernameVariable: 'nexus_user')]) {
+                  sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:${DEST_TOKEN} --dest-creds ${nexus_user}:${nexus_pass} docker://docker-registry-default.apps.mgmt.npd.msa.libgbl.biz:443/${TARGET_NAMESPACE}/${APPLICATION_NAME}:${newversion}  docker://nexus-registry.cicd.svc.cluster.local:5000/${APPLICATION_NAME}:${newversion} "
+                  }					
+          }
+      }
+
+      stage('Cleaning up the resources'){
+        // delete buildconfig, imagestream, deploymentconfig, service and route
+        sh "oc delete is ${RELEASE_APP} --ignore-not-found=true -n  ${TARGET_NAMESPACE}"
+        sh "oc delete all -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+        sh "oc delete configmap -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+        sh "oc delete secret -l app=${RELEASE_APP} -n  ${TARGET_NAMESPACE}"
+      }
+	}  
+}
+
+def tagging(message){
+	sh '''
+      echo "tag the release"
+      tag_version=$(mvn -s ./configuration/settings.xml -q \
+	    -Dexec.executable="echo" \
+        -Dexec.args='${project.version}' \
+        --non-recursive \
+        org.codehaus.mojo:exec-maven-plugin:1.3.1:exec)
+                            
+      name=$(mvn -s ./configuration/settings.xml -q \
+          -Dexec.executable="echo" \
+          -Dexec.args='${project.name}' \
+          --non-recursive \
+          org.codehaus.mojo:exec-maven-plugin:1.3.1:exec)
+
+      TagNumber="$(echo ${tag_version} | rev | cut -d " " -f1 |rev | cut -d '-' -f1)"                            
+      ReleaseName="$(echo ${name} | rev | cut -d " " -f1 |rev)"      
+                      
+      if [ ! -z "$TagNumber" -a "$TagNumber" != " " ]; then                              
+      git tag "${TagNumber}" -m "${MESSAGE}"
+      git push origin "${TagNumber}" 
+      fi
+	'''
+}
+
+def version() {
+      def matcher = readFile('pom.xml') =~ '<version>(.+)</version>'
+      matcher ? matcher[0][1] : null
+}
