@@ -1,0 +1,311 @@
+podTemplate(
+label: "lgi-jenkins-slave-maven",
+cloud: "openshift",
+inheritFrom: "maven",
+containers: [
+  containerTemplate(
+    name: "jnlp",
+    image: "docker-registry.default.svc:5000/cicd/lgi-jenkins-slave-maven",
+    resourceRequestMemory: "1Gi",
+    resourceLimitMemory: "2Gi",
+    envVars: [
+            envVar(key: 'http_proxy', value: env.http_proxy),
+            envVar(key: 'https_proxy', value: env.https_proxy),
+            envVar(key: 'no_proxy', value: env.no_proxy)]
+    )
+  ]
+)
+
+{
+	node('lgi-jenkins-slave-maven') {
+    	properties([
+      	parameters([
+		string(name: 'DEPLOY_BRANCH', defaultValue: 'development', description: 'deployment branch ex: development', ),
+        string(name: 'DEPLOYER_USER', defaultValue: '', description: 'deployer_username ex: deployer_username', ),
+        string(name: 'DEPLOYER_MAIL', defaultValue: '', description: 'deployer_mail ex: deployer_mail@domain.com', ),
+        string(name: 'APPLICATION_NAME', defaultValue: '', description: 'Name of application that is to be deployed ex: ie-clarify-customer-sys', ),
+		string(name: 'ROUTE_NAME', defaultValue: '', description: 'Name of application route', ),
+        choice(name: 'SECRETS',choices: ['Yes','No'], description: 'Does the module contain secret', ),
+		//choice(name: 'ROUTE_PARAM',choices: ['Yes','No'], description: 'Does the route name contain country code?', ),
+        choice(name: 'NEXUS_PARAM',choices: ['Yes','No'], description: 'Does the module have downstream connectivity, ie having -ms folder in repository', ),
+        string(name: 'TARGET_NAMESPACE', defaultValue: '', description: 'name of the namespace where need be release?  ex: ie-product-dev', )
+      	]),
+      	[$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '7', numToKeepStr: '5']]
+    	])
+
+      def APPLICATION_NAME = "${params.APPLICATION_NAME}"
+	  def TARGET_NAMESPACE = "${params.TARGET_NAMESPACE}"
+	  def COUNTRY = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | cut -f1 -d '-' | tr [:lower:] [:upper:]")
+	  def PROJECT_URL=""
+	  
+	  //def PROJECT_URL = "http://gitea.cicd.svc.cluster.local:3000/${COUNTRY}/${APPLICATION_NAME}.git"
+	  def USERNAME = "${params.DEPLOYER_USER}" 
+	  def MAIL = "${params.DEPLOYER_MAIL}"
+	  def ROUTE_NAME = "${params.ROUTE_NAME}"
+	  def APP_BRANCH = "*/${params.DEPLOY_BRANCH}"
+	  //def ARTIFACT_DIR = 'target'
+	  def CONFIGMAP_NAME = APPLICATION_NAME+"-properties"
+	  def OSCONFDIR = 'openshift/dev'
+	  def OCPDOMAIN = "apps.npd.msa.libgbl.biz"
+	  def BUILD_IMAGE = "lg-openjdk18-openshift"
+	  def MGMTDOMAIN = "apps.mgmt.npd.msa.libgbl.biz"
+	  //def SCMCRED_ID = "cicd-iescmcred"
+	  def SONAR_URL = "http://sonarqube.cicd.svc.cluster.local:9000"
+	  def GROUP_ID = "com.lgims.cio"
+	  //def ROUTE_NAME = sh(returnStdout: true, script: "echo ${params.APPLICATION_NAME} | cut --complement -d \"-\" -f1")
+      def GITEA_CREDID = "gitea_cred"
+      // def NEXUS_CREDID = "nexus_cred"
+      
+      def DEPLOY_BRANCH = "${params.DEPLOY_BRANCH}"
+      def SECRET_SELECTION = "${params.SECRETS}"
+      def NEXUS_SELECTION = "${params.NEXUS_PARAM}"
+      def ROUTE_PARAM = "${params.ROUTE_PARAM}"
+      def ARTIFACT_DIR = ""
+      def SECRET_FLAG = "1"
+      def SECRET_NAME = ""
+      def newversion = ""
+      def imageversion = ""
+	  def FLAG = "10"
+	  def ENV = "env"
+
+      //update the secret
+      if (SECRET_SELECTION == "Yes") {
+          echo "Secret function is true and Flag is changed"
+          SECRET_NAME = APPLICATION_NAME+"-secret"
+          SECRET_FLAG = 0
+      }
+
+      //update nexus app path
+      if (NEXUS_SELECTION == "Yes") {
+          echo "Module has downstream connectivity"
+          ARTIFACT_DIR = APPLICATION_NAME+"-ms/target"
+      }
+      else {
+          ARTIFACT_DIR = 'target'
+      }
+
+/*      //update the routename
+      if (ROUTE_PARAM == "Yes") {
+          echo "Route name contains Country code"
+		  ROUTE_NAME = APPLICATION_NAME
+          }
+	  else {
+		  echo "Route name does not contain Country code"
+		  ROUTE_NAME = sh(returnStdout: true, script: "echo ${params.APPLICATION_NAME} | cut --complement -d \"-\" -f1")
+	  }
+*/
+	  
+	  stage('Environment Verification'){
+		    ENV = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | rev | cut -f1 -d '-' | rev").trim()
+			sh "echo $ENV"
+			sh "echo flag is $FLAG"
+			COUNTRY=COUNTRY.trim()
+			echo "${COUNTRY}"
+			PROJECT_URL = "http://gitea.cicd.svc.cluster.local:3000/${COUNTRY}/${APPLICATION_NAME}.git"
+			echo "${PROJECT_URL}"
+			if (ENV != "dev"){
+				error("This pipeline can only be executed in Development Environment")
+				sh "echo flag is $FLAG"
+			}
+	  }
+
+/*      stage('Code checkout'){
+          //deleteDir()
+          sh "git config --global http.sslVerify false"
+          sh "git config --global credential.helper store"
+		checkout([$class: 'GitSCM', branches: [[name: APP_BRANCH ]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', 
+		relativeTargetDir: '.']], 
+		submoduleCfg: [], 
+	    userRemoteConfigs: [[credentialsId: SCMCRED_ID , url: PROJECT_URL, sslEnabled: false]]])
+          sh "git config user.email ${MAIL}"
+          sh "git config user.name ${USERNAME}"
+          sh "ls -ltr"
+          sh "pwd"
+        }
+*/
+
+      stage('Code checkout'){
+          //deleteDir()
+          sh "git config --global http.sslVerify false"
+          sh "git config --global credential.helper store"
+          COUNTRY = sh(returnStdout: true, script: "echo ${TARGET_NAMESPACE} | cut -f1 -d '-'").trim()
+          checkout([$class: 'GitSCM', branches: [[name: APP_BRANCH ]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 					'CleanBeforeCheckout']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'gitAdmin', url: 				 "https://git.apps.build.msa.libgbl.biz/$COUNTRY/${APPLICATION_NAME}"]]])
+          sh "git config user.email ${MAIL}"
+          sh "git config user.name ${USERNAME}"
+          sh "ls -ltr"
+          sh "pwd"
+        }
+
+
+      stage ('Code Analysis'){
+          echo "Running Code Analysis"
+          sh "mvn -s configuration/settings.xml clean install sonar:sonar -Dsonar.scm.disabled=true -Dsonar.sources=src/main "
+          sleep 20
+          PROJECTKEY="$GROUP_ID:$APPLICATION_NAME"
+          def SONAR_API_RESPONSE = "curl -k -X POST $SONAR_URL/api/qualitygates/project_status?projectKey=$PROJECTKEY"
+          def CMD_OUTPUT = sh returnStdout: true, script: "${SONAR_API_RESPONSE}"
+          def qualitygate =  readJSON text: CMD_OUTPUT
+
+          sh "echo Quality gate shows ${qualitygate.projectStatus.status}" 
+          if(qualitygate.projectStatus.status == "OK"){
+               echo "Sonar Quality check passed."
+          } 
+          else {
+               def errorList = " "
+               for (i = 0; i < qualitygate.projectStatus.conditions.size()-1; i++) {
+                   if (qualitygate.projectStatus.conditions[i].status == "ERROR"){
+                         def msg = "${qualitygate.projectStatus.conditions[i].metricKey} - Actual - ${qualitygate.projectStatus.conditions[i].actualValue} but Expected - ${qualitygate.projectStatus.conditions[i].errorThreshold}"
+                         if(errorList.size() <= 0)
+                            errorList = "errorList $msg"
+                         else
+                            errorList = "errorList , $msg"
+                   }
+               }
+               sh "echo Reasons for failure: $errorList "
+               error "Sonar Quality check failed."
+          }
+      }
+
+
+      stage('Create Image Builder') {
+          // Create or replace Image builder artifacts        
+          echo "Creating Image Builder"
+          sh "if oc get bc ${APPLICATION_NAME} -n cicd; \
+              then echo \"exist\"; \
+              else oc new-build --binary=true --name=${APPLICATION_NAME} ${BUILD_IMAGE} --labels=app=${APPLICATION_NAME} -n cicd;fi "                             
+      }
+
+      stage('Build OpenShift Image') {
+          echo "Building OpenShift container image ${APPLICATION_NAME}:latest"
+          // Start Binary Build in OpenShift CICD cluster using the file we just published
+          sh "rm -rf oc-build && mkdir -p oc-build/deployments"
+		  sh "cp ${ARTIFACT_DIR}/*.jar oc-build/deployments/"
+          sh "oc start-build ${APPLICATION_NAME} --from-dir=oc-build --wait=true  --follow=true -n cicd"
+		  echo "oc start build complete."
+      }
+
+      stage('Copy Image to Non-Prod Cluster'){
+          openshift.withCluster('non-prod'){
+            def token = openshift.raw("whoami -t")
+            def DEST_TOKEN = token.out.trim()
+            def SRC_TOKEN = sh(returnStdout: true, script:"oc whoami -t").trim()
+
+            //Copy the image to the registry on the non-prod cluster to the target namespace
+            sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:${SRC_TOKEN} --dest-creds openshift:${DEST_TOKEN} docker://docker-registry.default.svc:5000/cicd/${APPLICATION_NAME}:latest docker://docker-registry-default.apps.mgmt.npd.msa.libgbl.biz:443/${TARGET_NAMESPACE}/${APPLICATION_NAME}:latest"
+          }
+      }
+
+      stage('login to openshift'){
+          openshift.withCluster('non-prod'){
+            def token = openshift.raw("whoami -t")
+            def DEST_TOKEN = token.out.trim()
+            def server_url = openshift.raw("whoami --show-server")
+            def SERVER_URL = server_url.out.trim()
+            echo "server url ${SERVER_URL}"
+            sh "oc login -s ${SERVER_URL}  --token=${DEST_TOKEN} --insecure-skip-tls-verify"
+          }
+      }
+
+      stage('Update Configurations'){ 
+          sh "mkdir -p ${OSCONFDIR}/"
+          echo "creating configmaps"
+		  
+          // Update the Config Map
+          sh "oc process -f ./${OSCONFDIR}/configmap.yml -p APPLICATION_NAME=${APPLICATION_NAME} -p CONFIGMAP_NAME=${CONFIGMAP_NAME} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+        
+	      // Update the Secret
+		  if (SECRET_SELECTION == "Yes") {
+          sh "oc process -f ./${OSCONFDIR}/secret.yml -p APPLICATION_NAME=${APPLICATION_NAME} -p SECRET_NAME=${SECRET_NAME} -n ${TARGET_NAMESPACE} | oc apply -f - -n ${TARGET_NAMESPACE}"
+		  }
+    }
+
+      stage('Updating image') {
+          openshift.withCluster('non-prod'){
+              openshift.withProject( "${TARGET_NAMESPACE}" ){
+                  //  Update the Image on the Production Deployment Config
+                  openshift.raw("set","image dc/${APPLICATION_NAME}","${APPLICATION_NAME}=docker-registry.default.svc:5000/${TARGET_NAMESPACE}/${APPLICATION_NAME}:latest","-n ${TARGET_NAMESPACE}")
+                  }
+              }
+      }
+
+      stage('Verify Deployment'){
+            echo "verify deployment"
+            openshift.withCluster('non-prod'){
+            openshift.withProject( "${TARGET_NAMESPACE}" ) {
+				def deployment = openshift.selector('dc', "${APPLICATION_NAME}")
+				echo "rollout deployment"
+				deployment.rollout().latest()
+				timeout(time:10, unit:'MINUTES') {
+					echo "rollout status"
+					deployment.rollout().status()
+					deployment.related( 'pods' ).untilEach(1) {
+						return it.object().status.containerStatuses[0].ready
+       			    }
+				}
+            
+          echo "${APPLICATION_NAME} is running and it passed readiness check!"
+
+			}
+			}
+      }
+
+      stage('Create Routes') {
+          openshift.withCluster('non-prod'){
+              openshift.withProject( "${TARGET_NAMESPACE}" ) {
+                  // Always create a management route so that developers can test
+                  try {
+                      def template = openshift.withProject( 'msp-user-objects' ) {
+                          openshift.selector('template','msp-mgmt-route-non-prod').object()
+                      }
+                      openshift.create( openshift.process( template, "-p", "NAMESPACE=${TARGET_NAMESPACE}", "APP=${APPLICATION_NAME}", "TARGET_SERVICE=${APPLICATION_NAME}", "TARGET_PORT=8080-tcp" ) )
+                      //openshift.create( openshift.process( template, "-p", "NAMESPACE=${TARGET_NAMESPACE}", "APP=${APPLICATION_NAME}9090", "TARGET_SERVICE=${APPLICATION_NAME}", "TARGET_PORT=9090-tcp" ) )
+                  } catch(e) {
+                      echo e.getMessage()
+                      if(!e.getMessage().contains("AlreadyExists")){
+                          throw e
+                          }
+                  }   
+              }
+          }
+      }   
+
+  /*  stage('Sanity Check'){
+          echo "sanity test : ${APPLICATION_NAME}"
+          sleep 30
+          echo "Health check"
+         // sh "curl -i -k https://${APPLICATION_NAME}9090-${TARGET_NAMESPACE}.${MGMTDOMAIN}/actuator/health"
+
+          echo "Microservice info"
+        //  sh "curl -i -k -H 'Content-Length: 0' -X GET https://${APPLICATION_NAME}9090-${TARGET_NAMESPACE}.${MGMTDOMAIN}/actuator/info/"
+      }
+  */
+
+      stage('Remove management routes'){
+       sh "oc delete route ${APPLICATION_NAME}9090-mgmt --ignore-not-found=true -n ${TARGET_NAMESPACE}"
+       //sh "oc delete route ${APPLICATION_NAME}-mgmt --ignore-not-found=true -n ${TARGET_NAMESPACE}"
+	   }
+	   
+	   stage('Exporting Openshift Objects'){
+        sh "oc get -o yaml --export dc/${APPLICATION_NAME} -n ${TARGET_NAMESPACE} > ${OSCONFDIR}/deployment.yml " 
+        sh "oc get -o yaml --export svc/${APPLICATION_NAME} -n ${TARGET_NAMESPACE} > ${OSCONFDIR}/service.yml "
+		echo "${ROUTE_NAME}"
+        sh "oc get -o yaml --export route/${ROUTE_NAME}  -n ${TARGET_NAMESPACE} > ${OSCONFDIR}/route.yml "
+        sh "git checkout ${DEPLOY_BRANCH}"
+        sh "git config user.email ${MAIL}"
+        sh "git config user.name ${GITEA_CREDID}"
+        sh "git add ${OSCONFDIR}/"
+        sh "git pull origin ${DEPLOY_BRANCH}"
+        sh '''
+       
+         if ! git diff-index --quiet HEAD --; then
+    		git commit -m "updated the openshift object"
+            git status
+            git push -u origin ${DEPLOY_BRANCH}
+		 fi
+        
+       '''
+
+       
+      }
+	}  
+}
